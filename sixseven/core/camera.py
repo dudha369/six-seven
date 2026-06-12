@@ -1,10 +1,12 @@
 """Camera capture running on a dedicated QThread.
 
-Emits frames as QImage to avoid cross-thread OpenCV window issues and
-integrates cleanly with PySide6 signals/slots.
+Emits frames as numpy arrays and respects a configurable FPS cap
+to avoid flooding the main thread with more frames than it can process.
 """
 
 from __future__ import annotations
+
+import time
 
 import cv2
 import numpy as np
@@ -22,9 +24,15 @@ class CameraThread(QThread):
     frame_ready = Signal(np.ndarray)
     error = Signal(str)
 
-    def __init__(self, camera_index: int = 0, parent=None) -> None:
+    def __init__(
+        self,
+        camera_index: int = 0,
+        target_fps: int = 30,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._camera_index = camera_index
+        self._target_fps = max(target_fps, 1)
         self._running = False
         self._mutex = QMutex()
         self._mirror = True
@@ -55,6 +63,14 @@ class CameraThread(QThread):
             self.error.emit(f"Cannot open camera {self._camera_index}")
             return
 
+        # Try to set camera resolution and FPS for lower latency
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, self._target_fps)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        frame_interval = 1.0 / self._target_fps
+
         while True:
             self._mutex.lock()
             running = self._running
@@ -62,14 +78,21 @@ class CameraThread(QThread):
             if not running:
                 break
 
+            t0 = time.perf_counter()
+
             ok, frame = cap.read()
             if not ok:
+                self.msleep(5)
                 continue
 
             if self._mirror:
                 frame = cv2.flip(frame, 1)
 
             self.frame_ready.emit(frame)
-            self.msleep(1)  # yield to event loop
+
+            # Sleep to respect FPS cap — avoids CPU spin and frame flooding
+            elapsed = time.perf_counter() - t0
+            sleep_ms = max(1, int((frame_interval - elapsed) * 1000))
+            self.msleep(sleep_ms)
 
         cap.release()
