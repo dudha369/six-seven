@@ -1,15 +1,62 @@
-"""Improved SixSeven gesture detector with smoothing and state machine."""
+"""Improved SixSeven gesture detector using MediaPipe Tasks API.
+
+Uses PoseLandmarker (modern Tasks API) instead of the deprecated
+``mp.solutions.pose``.  The model file is auto-downloaded on first run
+and cached in ``~/.sixseven/models/``.
+"""
 
 from __future__ import annotations
 
 import enum
 import time
+import urllib.request
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
-import mediapipe as mp
 import numpy as np
+
+import mediapipe as mp
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import (
+    PoseLandmarker,
+    PoseLandmarkerOptions,
+    PoseLandmarkerResult,
+    PoseLandmarksConnections,
+)
+from mediapipe.tasks.python.vision.core.image import Image as MpImage, ImageFormat
+from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+    VisionTaskRunningMode,
+)
+
+# ---------------------------------------------------------------------------
+# Model auto-download
+# ---------------------------------------------------------------------------
+_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "pose_landmarker/pose_landmarker_lite/float16/latest/"
+    "pose_landmarker_lite.task"
+)
+_MODEL_DIR = Path.home() / ".sixseven" / "models"
+_MODEL_PATH = _MODEL_DIR / "pose_landmarker_lite.task"
+
+
+def _ensure_model() -> str:
+    """Download the pose-landmarker model if it doesn't exist yet."""
+    if _MODEL_PATH.is_file():
+        return str(_MODEL_PATH)
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"[Detector] Downloading model → {_MODEL_PATH} …")
+    urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+    print("[Detector] Download complete.")
+    return str(_MODEL_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Pose skeleton connections for drawing
+# ---------------------------------------------------------------------------
+_POSE_CONNECTIONS = PoseLandmarksConnections.POSE_LANDMARKS
 
 
 class GestureState(enum.Enum):
@@ -35,6 +82,7 @@ class GestureDetector:
     """Detects the SixSeven alternating-hand gesture via MediaPipe Pose.
 
     Improvements over the original:
+    * Uses the modern MediaPipe Tasks API (``PoseLandmarker``).
     * Rolling-window smoothing of wrist Y positions to filter micro-jitter.
     * State machine (IDLE → DETECTING → TRIGGERED → COOLDOWN) to avoid
       duplicate triggers and provide UI-friendly status.
@@ -42,7 +90,7 @@ class GestureDetector:
     * Separate ``detect`` (pure logic) from ``draw`` (visualisation).
     """
 
-    # MediaPipe Pose landmark indices
+    # MediaPipe Pose landmark indices (BlazePose topology)
     _L_SHOULDER, _L_ELBOW, _L_WRIST = 11, 13, 15
     _R_SHOULDER, _R_ELBOW, _R_WRIST = 12, 14, 16
 
@@ -60,13 +108,18 @@ class GestureDetector:
         self._smooth_n = max(smoothing_window, 1)
         self._show_landmarks = show_landmarks
 
-        self._mp_pose = mp.solutions.pose
-        self._pose = self._mp_pose.Pose(
-            min_detection_confidence=0.7,
+        # ---- MediaPipe Tasks PoseLandmarker ----
+        model_path = _ensure_model()
+        options = PoseLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=VisionTaskRunningMode.VIDEO,
+            num_poses=1,
+            min_pose_detection_confidence=0.7,
+            min_pose_presence_confidence=0.7,
             min_tracking_confidence=0.7,
         )
-        self._mp_draw = mp.solutions.drawing_utils
-        self._mp_style = mp.solutions.drawing_styles
+        self._landmarker = PoseLandmarker.create_from_options(options)
+        self._frame_ts: int = 0  # monotonically increasing timestamp (ms)
 
         # Smoothing buffers (deques of Y-values)
         self._left_y_buf: deque[float] = deque(maxlen=self._smooth_n)
@@ -87,29 +140,37 @@ class GestureDetector:
     def process(self, frame: np.ndarray) -> DetectionResult:
         """Run detection on *frame* (BGR) and return annotated result."""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self._pose.process(rgb)
+
+        # Create MediaPipe Image and run pose detection
+        mp_image = MpImage(image_format=ImageFormat.SRGB, data=rgb)
+        self._frame_ts += 33  # ~30 fps increments
+        pose_result: PoseLandmarkerResult = self._landmarker.detect_for_video(
+            mp_image, self._frame_ts
+        )
 
         result = DetectionResult(frame=frame, state=self._state)
 
-        if results.pose_landmarks is None:
+        if not pose_result.pose_landmarks:
             self._reset_tracking()
             result.state = GestureState.IDLE
             return result
 
-        if self._show_landmarks:
-            self._draw_landmarks(frame, results.pose_landmarks)
+        # First detected person's landmarks
+        landmarks = pose_result.pose_landmarks[0]
 
-        lm = results.pose_landmarks.landmark
-        l_angle = self._angle(lm, self._L_SHOULDER, self._L_ELBOW, self._L_WRIST)
-        r_angle = self._angle(lm, self._R_SHOULDER, self._R_ELBOW, self._R_WRIST)
+        if self._show_landmarks:
+            self._draw_landmarks(frame, landmarks)
+
+        l_angle = self._angle(landmarks, self._L_SHOULDER, self._L_ELBOW, self._L_WRIST)
+        r_angle = self._angle(landmarks, self._R_SHOULDER, self._R_ELBOW, self._R_WRIST)
         result.left_angle = l_angle
         result.right_angle = r_angle
 
         elbows_bent = l_angle < self._angle_limit and r_angle < self._angle_limit
 
         # Smooth wrist Y
-        self._left_y_buf.append(lm[self._L_WRIST].y)
-        self._right_y_buf.append(lm[self._R_WRIST].y)
+        self._left_y_buf.append(landmarks[self._L_WRIST].y)
+        self._right_y_buf.append(landmarks[self._R_WRIST].y)
         curr_left_y = float(np.mean(self._left_y_buf))
         curr_right_y = float(np.mean(self._right_y_buf))
 
@@ -178,7 +239,7 @@ class GestureDetector:
             self._show_landmarks = show_landmarks
 
     def release(self) -> None:
-        self._pose.close()
+        self._landmarker.close()
 
     # --- internals ----------------------------------------------------
 
@@ -206,16 +267,26 @@ class GestureDetector:
     def _draw_landmarks(
         self,
         frame: np.ndarray,
-        pose_landmarks: object,
+        landmarks: list,
     ) -> None:
-        self._mp_draw.draw_landmarks(
-            frame,
-            pose_landmarks,
-            self._mp_pose.POSE_CONNECTIONS,
-            landmark_drawing_spec=self._mp_draw.DrawingSpec(
-                color=(0, 255, 128), thickness=2, circle_radius=3
-            ),
-            connection_drawing_spec=self._mp_draw.DrawingSpec(
-                color=(200, 200, 200), thickness=1
-            ),
-        )
+        """Draw pose landmarks and connections on the frame."""
+        h, w = frame.shape[:2]
+
+        def _px(lm) -> tuple[int, int] | None:
+            x, y = int(lm.x * w), int(lm.y * h)
+            if 0 <= x < w and 0 <= y < h:
+                return (x, y)
+            return None
+
+        # Draw connections
+        for conn in _POSE_CONNECTIONS:
+            pt1 = _px(landmarks[conn.start])
+            pt2 = _px(landmarks[conn.end])
+            if pt1 and pt2:
+                cv2.line(frame, pt1, pt2, (200, 200, 200), 1, cv2.LINE_AA)
+
+        # Draw landmark points
+        for lm in landmarks:
+            pt = _px(lm)
+            if pt:
+                cv2.circle(frame, pt, 3, (0, 255, 128), -1, cv2.LINE_AA)
